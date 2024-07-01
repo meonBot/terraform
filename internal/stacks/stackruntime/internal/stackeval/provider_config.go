@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hcldec"
@@ -175,6 +176,12 @@ func (p *ProviderConfig) ResolveExpressionReference(ctx context.Context, ref sta
 	return ret, diags
 }
 
+// PlanTimestamp implements ExpressionScope, providing the timestamp at which
+// the current plan is being run.
+func (p *ProviderConfig) PlanTimestamp() time.Time {
+	return p.main.PlanTimestamp()
+}
+
 // ExprReferenceValue implements Referenceable.
 func (p *ProviderConfig) ExprReferenceValue(ctx context.Context, phase EvalPhase) cty.Value {
 	// We don't say anything about the contents of a provider during the
@@ -223,4 +230,9 @@ func (p *ProviderConfig) PlanChanges(ctx context.Context) ([]stackplan.PlannedCh
 // tracingName implements Validatable.
 func (p *ProviderConfig) tracingName() string {
 	return p.Addr().String()
+}
+
+// reportNamedPromises implements namedPromiseReporter.
+func (p *ProviderConfig) reportNamedPromises(cb func(id promising.PromiseID, name string)) {
+	cb(p.providerArgs.PromiseID(), p.Addr().String())
 }

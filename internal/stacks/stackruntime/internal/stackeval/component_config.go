@@ -6,6 +6,7 @@ package stackeval
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/apparentlymart/go-versions/versions"
 	"github.com/hashicorp/go-slug/sourceaddrs"
@@ -179,6 +180,16 @@ func (c *ComponentConfig) validateModuleForStacks(moduleAddr addrs.Module, modul
 	return diags
 }
 
+func (c *ComponentConfig) RootModuleVariableDecls(ctx context.Context) map[string]*configs.Variable {
+	moduleTree := c.ModuleTree(ctx)
+	if moduleTree == nil {
+		// If the module tree is invalid then we'll just assume there aren't
+		// any variables declared.
+		return nil
+	}
+	return moduleTree.Module.Variables
+}
+
 // InputsType returns an object type that the object representing the caller's
 // values for this component's input variables must conform to.
 func (c *ComponentConfig) InputsType(ctx context.Context) (cty.Type, *typeexpr.Defaults) {
@@ -220,9 +231,10 @@ func (c *ComponentConfig) CheckInputVariableValues(ctx context.Context, phase Ev
 	}
 
 	decl := c.Declaration(ctx)
+	varDecls := c.RootModuleVariableDecls(ctx)
 
 	// We don't care about the returned value, only that it has no errors.
-	_, diags := EvalComponentInputVariables(ctx, wantTy, defs, decl, phase, c)
+	_, diags := EvalComponentInputVariables(ctx, varDecls, wantTy, defs, decl, phase, c)
 	return diags
 }
 
@@ -336,6 +348,12 @@ func (c *ComponentConfig) CheckProviders(ctx context.Context, phase EvalPhase) (
 				})
 				continue
 			}
+		} else if result.Value == cty.DynamicVal {
+			// Then we don't know the concrete type of this reference at this
+			// time, so we'll just have to accept it. This is somewhat expected
+			// during the validation phase, and even during the planning phase
+			// if we have deferred attributes. We'll get an error later (ie.
+			// during the plan phase) if the type doesn't match up then.
 		} else {
 			// We got something that isn't a provider reference at all.
 			diags = diags.Append(&hcl.Diagnostic{
@@ -432,6 +450,12 @@ func (c *ComponentConfig) ResolveExpressionReference(ctx context.Context, ref st
 	return c.StackConfig(ctx).resolveExpressionReference(ctx, ref, nil, repetition)
 }
 
+// PlanTimestamp implements ExpressionScope, providing the timestamp at which
+// the current plan is being run.
+func (c *ComponentConfig) PlanTimestamp() time.Time {
+	return c.main.PlanTimestamp()
+}
+
 func (c *ComponentConfig) checkValid(ctx context.Context, phase EvalPhase) tfdiags.Diagnostics {
 	diags, err := c.validate.Do(ctx, func(ctx context.Context) (tfdiags.Diagnostics, error) {
 		var diags tfdiags.Diagnostics
@@ -497,6 +521,19 @@ func (c *ComponentConfig) checkValid(ctx context.Context, phase EvalPhase) tfdia
 			}
 		}()
 
+		// When our given context is cancelled, we want to instruct the
+		// modules runtime to stop the running operation. We use this
+		// nested context to ensure that we don't leak a goroutine when the
+		// parent context isn't cancelled.
+		operationCtx, operationCancel := context.WithCancel(ctx)
+		defer operationCancel()
+		go func() {
+			<-operationCtx.Done()
+			if ctx.Err() == context.Canceled {
+				tfCtx.Stop()
+			}
+		}()
+
 		diags = diags.Append(tfCtx.Validate(moduleTree, &terraform.ValidateOpts{
 			ExternalProviders: providerClients,
 		}))
@@ -523,6 +560,12 @@ func (c *ComponentConfig) PlanChanges(ctx context.Context) ([]stackplan.PlannedC
 
 func (c *ComponentConfig) tracingName() string {
 	return c.Addr().String()
+}
+
+// reportNamedPromises implements namedPromiseReporter.
+func (c *ComponentConfig) reportNamedPromises(cb func(id promising.PromiseID, name string)) {
+	cb(c.validate.PromiseID(), c.Addr().String())
+	cb(c.moduleTree.PromiseID(), c.Addr().String()+" modules")
 }
 
 // sourceBundleModuleWalker is an implementation of [configs.ModuleWalker]

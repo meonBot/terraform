@@ -217,6 +217,10 @@
       }
     ]
   },
+  {
+    "title": "Moved block",
+    "path": "moved"
+  },
   { "title": "Checks", "path": "checks" },
   {
       "title": "Import",
@@ -360,6 +364,10 @@
           {
             "title": "<code>substr</code>",
             "href": "/language/functions/substr"
+          },
+          {
+            "title": "<code>templatestring</code>",
+            "href": "/language/functions/templatestring"
           },
           {
             "title": "<code>title</code>",
@@ -889,6 +897,11 @@
         "path": "functions/templatefile",
         "hidden": true
       },
+      {
+        "title": "templatestring",
+        "path": "functions/templatestring",
+        "hidden": true
+      },
       { "title": "terraform-encode_tfvars", "path": "functions/terraform-encode_tfvars", "hidden": true },
       { "title": "terraform-decode_tfvars", "path": "functions/terraform-decode_tfvars", "hidden": true },
       { "title": "terraform-encode_expr", "path": "functions/terraform-encode_expr", "hidden": true },
@@ -933,7 +946,7 @@
     "title": "Terraform Settings",
     "routes": [
       { "title": "Overview", "path": "settings" },
-      { "title": "Terraform Cloud", "path": "settings/terraform-cloud" },
+      { "title": "HCP Terraform", "path": "settings/cloud" },
       {
         "title": "Backends",
         "routes": [
@@ -1089,7 +1102,7 @@
     ]
   },
   {
-    "title": "Upgrading to Terraform v1.7",
+    "title": "Upgrading to Terraform v1.9",
     "path": "upgrade-guides"
   },
   {

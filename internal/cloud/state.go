@@ -39,9 +39,9 @@ const (
 )
 
 // State implements the State interfaces in the state package to handle
-// reading and writing the remote state to TFC. This State on its own does no
-// local caching so every persist will go to the remote storage and local
-// writes will go to memory.
+// reading and writing the remote state to HCP Terraform. This State on
+// its own does no local caching so every persist will go to the remote
+// storage and local writes will go to memory.
 type State struct {
 	mu sync.Mutex
 
@@ -160,7 +160,7 @@ func (s *State) WriteState(state *states.State) error {
 	return nil
 }
 
-// PersistState uploads a snapshot of the latest state as a StateVersion to Terraform Cloud
+// PersistState uploads a snapshot of the latest state as a StateVersion to HCP Terraform
 func (s *State) PersistState(schemas *schemarepo.Schemas) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -514,13 +514,38 @@ func (s *State) Delete(force bool) error {
 	return nil
 }
 
-// GetRootOutputValues fetches output values from Terraform Cloud
-func (s *State) GetRootOutputValues() (map[string]*states.OutputValue, error) {
-	ctx := context.Background()
+// GetRootOutputValues fetches output values from HCP Terraform
+func (s *State) GetRootOutputValues(ctx context.Context) (map[string]*states.OutputValue, error) {
+	// The cloud backend initializes this value to true, but we want to implement
+	// some custom retry logic. This code presumes that the tfeClient doesn't need
+	// to be shared with other goroutines by the caller.
+	s.tfeClient.RetryServerErrors(false)
+	defer s.tfeClient.RetryServerErrors(true)
 
-	so, err := s.tfeClient.StateVersionOutputs.ReadCurrent(ctx, s.workspace.ID)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+
+	var so *tfe.StateVersionOutputsList
+	err := RetryBackoff(ctx, func() error {
+		var err error
+		so, err = s.tfeClient.StateVersionOutputs.ReadCurrent(ctx, s.workspace.ID)
+
+		if err != nil {
+			if strings.Contains(err.Error(), "service unavailable") {
+				return err
+			}
+			return NonRetryableError{err}
+		}
+		return nil
+	})
 
 	if err != nil {
+		switch err {
+		case context.DeadlineExceeded:
+			return nil, fmt.Errorf("current outputs were not ready to be read within the deadline. Please try again")
+		case context.Canceled:
+			return nil, fmt.Errorf("canceled reading current outputs")
+		}
 		return nil, fmt.Errorf("could not read state version outputs: %w", err)
 	}
 

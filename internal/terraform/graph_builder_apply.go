@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/dag"
+	"github.com/hashicorp/terraform/internal/moduletest/mocking"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
@@ -26,6 +27,10 @@ type ApplyGraphBuilder struct {
 
 	// Changes describes the changes that we need apply.
 	Changes *plans.Changes
+
+	// DeferredChanges describes the changes that were deferred during the plan
+	// and should not be applied.
+	DeferredChanges []*plans.DeferredResourceInstanceChangeSrc
 
 	// State is the current state
 	State *states.State
@@ -64,6 +69,10 @@ type ApplyGraphBuilder struct {
 	// nodes that should not be pruned even if they are not referenced within
 	// the actual graph.
 	ExternalReferences []*addrs.Reference
+
+	// Overrides provides the set of overrides supplied by the testing
+	// framework.
+	Overrides *mocking.Overrides
 }
 
 // See GraphBuilder
@@ -116,10 +125,12 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 			Config:       b.Config,
 			DestroyApply: b.Operation == walkDestroy,
 		},
+		&variableValidationTransformer{},
 		&LocalTransformer{Config: b.Config},
 		&OutputTransformer{
 			Config:     b.Config,
 			Destroying: b.Operation == walkDestroy,
+			Overrides:  b.Overrides,
 		},
 
 		// Creates all the resource instances represented in the diff, along
@@ -130,6 +141,11 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 			State:    b.State,
 			Changes:  b.Changes,
 			Config:   b.Config,
+		},
+
+		// Creates nodes for all the deferred changes.
+		&DeferredTransformer{
+			DeferredChanges: b.DeferredChanges,
 		},
 
 		// Add nodes and edges for check block assertions. Check block data
@@ -190,10 +206,12 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
 			State:  b.State,
 		},
 
-		// We need to remove configuration nodes that are not used at all, as
-		// they may not be able to evaluate, especially during destroy.
-		// These include variables, locals, and instance expanders.
-		&pruneUnusedNodesTransformer{},
+		// In a destroy, we need to remove configuration nodes that are not used
+		// at all, as they may not be able to evaluate. These include variables,
+		// locals, and instance expanders.
+		&pruneUnusedNodesTransformer{
+			skip: b.Operation != walkDestroy,
+		},
 
 		// Target
 		&TargetsTransformer{Targets: b.Targets},

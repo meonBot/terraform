@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/dag"
 	"github.com/hashicorp/terraform/internal/states"
@@ -47,14 +49,6 @@ type nodeExpandPlannableResource struct {
 	// structure in the future, as we need to compare for equality and take the
 	// union of multiple groups of dependencies.
 	dependencies []addrs.ConfigResource
-
-	// these are a record of all the addresses used in expansion so they can be
-	// validated as a complete set. While the type is guaranteed to be
-	// addrs.AbsResourceInstance for all these, we use addrs.Checkable because
-	// the expandedInstances need to be passed to the check state to register
-	// the instances for checks.
-	expandedImports   addrs.Set[addrs.Checkable]
-	expandedInstances addrs.Set[addrs.Checkable]
 }
 
 var (
@@ -103,10 +97,22 @@ func (n *nodeExpandPlannableResource) ModifyCreateBeforeDestroy(v bool) error {
 }
 
 func (n *nodeExpandPlannableResource) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagnostics) {
-	var g Graph
+	var diags tfdiags.Diagnostics
 
+	// First, make sure the count and the foreach don't refer to the same
+	// resource. The config maybe nil if we are generating configuration, or
+	// deleting a resource.
+	if n.Config != nil {
+		diags = diags.Append(validateSelfRefInExpr(n.Addr.Resource, n.Config.Count))
+		diags = diags.Append(validateSelfRefInExpr(n.Addr.Resource, n.Config.ForEach))
+		if diags.HasErrors() {
+			return nil, diags
+		}
+	}
+
+	// Expand the current module.
 	expander := ctx.InstanceExpander()
-	moduleInstances := expander.ExpandModule(n.Addr.Module)
+	moduleInstances := expander.ExpandModule(n.Addr.Module, false)
 
 	// The possibility of partial-expanded modules and resources is guarded by a
 	// top-level option for the whole plan, so that we can preserve mainline
@@ -114,10 +120,176 @@ func (n *nodeExpandPlannableResource) DynamicExpand(ctx EvalContext) (*Graph, tf
 	// entirely-separate codepath in those situations, at the expense of
 	// duplicating some of the logic for behavior this method would normally
 	// handle.
-	if ctx.Deferrals().DeferralAllowed() {
-		pem := expander.UnknownModuleInstances(n.Addr.Module)
-		return n.dynamicExpandWithDeferralAllowed(ctx, moduleInstances, pem)
+	if ctx.Deferrals().DeferralAllowed() { // Expand the imports for this resource.
+		knownImports, unknownImports, importDiags := n.expandResourceImports(ctx, true)
+		diags = diags.Append(importDiags)
+
+		pem := expander.UnknownModuleInstances(n.Addr.Module, false)
+		g, expandDiags := n.dynamicExpandPartial(ctx, moduleInstances, pem, knownImports, unknownImports)
+		diags = diags.Append(expandDiags)
+		return g, diags
 	}
+
+	// Expand the imports for this resource.
+	imports, unknownImports, importDiags := n.expandResourceImports(ctx, false)
+	diags = diags.Append(importDiags)
+
+	// Since allowUnknown was set to false in expandResourceImports, we should
+	// not have any unknown imports.
+	if unknownImports.Len() > 0 {
+		panic("unexpected unknown imports")
+	}
+
+	g, expandDiags := n.dynamicExpand(ctx, moduleInstances, imports)
+	diags = diags.Append(expandDiags)
+	return g, diags
+}
+
+// Import blocks are expanded in conjunction with their associated resource block.
+func (n *nodeExpandPlannableResource) expandResourceImports(ctx EvalContext, allowUnknown bool) (addrs.Map[addrs.AbsResourceInstance, cty.Value], addrs.Map[addrs.PartialExpandedResource, addrs.Set[addrs.AbsResourceInstance]], tfdiags.Diagnostics) {
+	// Imports maps the target address to an import ID.
+	knownImports := addrs.MakeMap[addrs.AbsResourceInstance, cty.Value]()
+	unknownImports := addrs.MakeMap[addrs.PartialExpandedResource, addrs.Set[addrs.AbsResourceInstance]]()
+	var diags tfdiags.Diagnostics
+
+	if len(n.importTargets) == 0 {
+		return knownImports, unknownImports, diags
+	}
+
+	// Import blocks are only valid within the root module, and must be
+	// evaluated within that context
+	ctx = evalContextForModuleInstance(ctx, addrs.RootModuleInstance)
+
+	state := ctx.State()
+
+	for _, imp := range n.importTargets {
+		if imp.Config == nil {
+			// if we have a legacy addr, it was supplied on the commandline so
+			// there is nothing to expand
+			if !imp.LegacyAddr.Equal(addrs.AbsResourceInstance{}) {
+				knownImports.Put(imp.LegacyAddr, cty.StringVal(imp.IDString))
+				return knownImports, unknownImports, diags
+			}
+
+			// legacy import tests may have no configuration
+			log.Printf("[WARN] no configuration for import target %#v", imp)
+			continue
+		}
+
+		if imp.Config.ForEach == nil {
+			importID, evalDiags := evaluateImportIdExpression(imp.Config.ID, ctx, EvalDataForNoInstanceKey, allowUnknown)
+			diags = diags.Append(evalDiags)
+			if diags.HasErrors() {
+				return knownImports, unknownImports, diags
+			}
+
+			traversal, hds := hcl.AbsTraversalForExpr(imp.Config.To)
+			diags = diags.Append(hds)
+			to, tds := addrs.ParseAbsResourceInstance(traversal)
+			diags = diags.Append(tds)
+			if diags.HasErrors() {
+				return knownImports, unknownImports, diags
+			}
+
+			knownImports.Put(to, importID)
+
+			log.Printf("[TRACE] expandResourceImports: found single import target %s", to)
+			continue
+		}
+
+		forEachData, known, forEachDiags := newForEachEvaluator(imp.Config.ForEach, ctx, allowUnknown).ImportValues()
+		diags = diags.Append(forEachDiags)
+		if forEachDiags.HasErrors() {
+			return knownImports, unknownImports, diags
+		}
+
+		if !known {
+			// Then we need to parse the target address as a PartialResource
+			// instead of a known resource.
+			addr, evalDiags := evalImportUnknownToExpression(imp.Config.To)
+			diags = diags.Append(evalDiags)
+			if diags.HasErrors() {
+				return knownImports, unknownImports, diags
+			}
+
+			// We're going to work out which instances this import block might
+			// target actually already exist.
+			knownInstances := addrs.MakeSet[addrs.AbsResourceInstance]()
+
+			cfg := addr.ConfigResource()
+			modInsts := state.ModuleInstances(cfg.Module)
+			for _, modInst := range modInsts {
+				abs := cfg.Absolute(modInst)
+				resource := state.Resource(cfg.Absolute(modInst))
+				if resource == nil {
+					// Then we are creating every instance of this resource.
+					continue
+				}
+
+				for inst := range resource.Instances {
+					knownInstances.Add(abs.Instance(inst))
+				}
+			}
+
+			unknownImports.Put(addr, knownInstances)
+			continue
+		}
+
+		for _, keyData := range forEachData {
+			res, evalDiags := evalImportToExpression(imp.Config.To, keyData)
+			diags = diags.Append(evalDiags)
+			if diags.HasErrors() {
+				return knownImports, unknownImports, diags
+			}
+
+			importID, evalDiags := evaluateImportIdExpression(imp.Config.ID, ctx, keyData, allowUnknown)
+			diags = diags.Append(evalDiags)
+			if diags.HasErrors() {
+				return knownImports, unknownImports, diags
+			}
+
+			knownImports.Put(res, importID)
+			log.Printf("[TRACE] expandResourceImports: expanded import target %s", res)
+		}
+	}
+
+	// filter out any known import which already exist in state
+	for _, el := range knownImports.Elements() {
+		if state.ResourceInstance(el.Key) != nil {
+			log.Printf("[DEBUG] expandResourceImports: skipping import address %s already in state", el.Key)
+			knownImports.Remove(el.Key)
+		}
+	}
+
+	return knownImports, unknownImports, diags
+}
+
+// validateExpandedImportTargets checks that all expanded imports correspond to
+// a configured instance.
+//
+// This function is only called from within the dynamicExpand method, the
+// import validation is inlined within the dynamicExpandPartial method for the
+// alternate code path.
+func (n *nodeExpandPlannableResource) validateExpandedImportTargets(expandedImports addrs.Map[addrs.AbsResourceInstance, cty.Value], expandedInstances addrs.Set[addrs.Checkable]) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	for _, addr := range expandedImports.Keys() {
+		if !expandedInstances.Has(addr) {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Configuration for import target does not exist",
+				fmt.Sprintf("The configuration for the given import %s does not exist. All target instances must have an associated configuration to be imported.", addr),
+			))
+			return diags
+		}
+	}
+
+	return diags
+}
+
+func (n *nodeExpandPlannableResource) dynamicExpand(ctx EvalContext, moduleInstances []addrs.ModuleInstance, imports addrs.Map[addrs.AbsResourceInstance, cty.Value]) (*Graph, tfdiags.Diagnostics) {
+	var g Graph
+	var diags tfdiags.Diagnostics
 
 	// Lock the state while we inspect it
 	state := ctx.State().Lock()
@@ -143,29 +315,12 @@ func (n *nodeExpandPlannableResource) DynamicExpand(ctx EvalContext) (*Graph, tf
 	state = nil
 	ctx.State().Unlock()
 
-	// The concrete resource factory we'll use for orphans
-	concreteResourceOrphan := func(a *NodeAbstractResourceInstance) *NodePlannableResourceInstanceOrphan {
-		// Add the config and state since we don't do that via transforms
-		a.Config = n.Config
-		a.ResolvedProvider = n.ResolvedProvider
-		a.Schema = n.Schema
-		a.ProvisionerSchemas = n.ProvisionerSchemas
-		a.ProviderMetas = n.ProviderMetas
-		a.Dependencies = n.dependencies
-
-		return &NodePlannableResourceInstanceOrphan{
-			NodeAbstractResourceInstance: a,
-			skipRefresh:                  n.skipRefresh,
-			skipPlanChanges:              n.skipPlanChanges,
-		}
-	}
-
 	for _, res := range orphans {
 		for key := range res.Instances {
 			addr := res.Addr.Instance(key)
 			abs := NewNodeAbstractResourceInstance(addr)
 			abs.AttachResourceState(res)
-			n := concreteResourceOrphan(abs)
+			n := n.concreteResourceOrphan(abs)
 			g.Add(n)
 		}
 	}
@@ -177,19 +332,21 @@ func (n *nodeExpandPlannableResource) DynamicExpand(ctx EvalContext) (*Graph, tf
 	// We'll gather up all of the leaf instances we learn about along the way
 	// so that we can inform the checks subsystem of which instances it should
 	// be expecting check results for, below.
-	var diags tfdiags.Diagnostics
-	n.expandedImports = addrs.MakeSet[addrs.Checkable]()
-	n.expandedInstances = addrs.MakeSet[addrs.Checkable]()
+
+	expandedInstances := addrs.MakeSet[addrs.Checkable]()
 	for _, module := range moduleInstances {
 		resAddr := n.Addr.Resource.Absolute(module)
-		err := n.expandResourceInstances(ctx, resAddr, &g)
+		instances, err := n.expandResourceInstances(ctx, resAddr, imports, &g)
 		diags = diags.Append(err)
+		for _, instance := range instances {
+			expandedInstances.Add(instance)
+		}
 	}
 	if diags.HasErrors() {
 		return nil, diags
 	}
 
-	diags = diags.Append(n.validateExpandedImportTargets())
+	diags = diags.Append(n.validateExpandedImportTargets(imports, expandedInstances))
 
 	// If this is a resource that participates in custom condition checks
 	// (i.e. it has preconditions or postconditions) then the check state
@@ -197,235 +354,12 @@ func (n *nodeExpandPlannableResource) DynamicExpand(ctx EvalContext) (*Graph, tf
 	// treat them as unknown status if we encounter an error before actually
 	// visiting the checks.
 	if checkState := ctx.Checks(); checkState.ConfigHasChecks(n.NodeAbstractResource.Addr) {
-		checkState.ReportCheckableObjects(n.NodeAbstractResource.Addr, n.expandedInstances)
+		checkState.ReportCheckableObjects(n.NodeAbstractResource.Addr, expandedInstances)
 	}
 
 	addRootNodeToGraph(&g)
 
 	return &g, diags
-}
-
-// dynamicExpandWithDeferralAllowed is a variant of DynamicExpand that we use
-// when deferred actions are enabled for the current plan.
-//
-// Once deferred actions are more stable and robust in the stacks runtime, it
-// would be nice to integrate this logic a little better with the main
-// DynamicExpand logic, but it's separate for now to minimize the risk of
-// stacks-specific behavior impacting configurations that are not opted into it.
-func (n *nodeExpandPlannableResource) dynamicExpandWithDeferralAllowed(globalCtx EvalContext, knownInsts []addrs.ModuleInstance, partialInsts addrs.Set[addrs.PartialExpandedModule]) (*Graph, tfdiags.Diagnostics) {
-	var g Graph
-	var diags tfdiags.Diagnostics
-
-	// We need to resolve the expansions of the resource itself, separately
-	// for each of the dynamic module prefixes it appears under.
-	knownAddrs := addrs.MakeSet[addrs.AbsResourceInstance]()
-	partialExpandedAddrs := addrs.MakeSet[addrs.PartialExpandedResource]()
-	for _, moduleAddr := range knownInsts {
-		resourceAddr := n.Addr.Resource.Absolute(moduleAddr)
-		// The rest of our work here needs to know which module instance it's
-		// working in, so that it can evaluate expressions in the appropriate scope.
-		moduleCtx := evalContextForModuleInstance(globalCtx, resourceAddr.Module)
-
-		// writeResourceState calculates the dynamic expansion of the given
-		// resource as a side-effect, along with its other work.
-		moreDiags := n.writeResourceState(moduleCtx, resourceAddr)
-		diags = diags.Append(moreDiags)
-		if moreDiags.HasErrors() {
-			continue
-		}
-
-		// We can now ask for all of the individual resource instances that
-		// we know, or for those with not-yet-known expansion.
-		expander := moduleCtx.InstanceExpander()
-		_, knownInstKeys, haveUnknownKeys := expander.ResourceInstanceKeys(resourceAddr)
-		for _, instKey := range knownInstKeys {
-			instAddr := resourceAddr.Instance(instKey)
-			knownAddrs.Add(instAddr)
-		}
-		if haveUnknownKeys {
-			partialAddr := moduleAddr.UnexpandedResource(resourceAddr.Resource)
-			partialExpandedAddrs.Add(partialAddr)
-		}
-	}
-	for _, moduleAddr := range partialInsts {
-		// Resources that appear under partial-expanded module prefixes are
-		// also partial-expanded resource addresses.
-		partialAddr := moduleAddr.Resource(n.Addr.Resource)
-		partialExpandedAddrs.Add(partialAddr)
-	}
-	// If we accumulated any error diagnostics in our work so far then
-	// we'll just bail out at this point.
-	if diags.HasErrors() {
-		return nil, diags
-	}
-
-	// We need to search the prior state for any resource instances that
-	// belong to module instances that are no longer declared in the
-	// configuration, which is one way a resource instance can be classified
-	// as an "orphan".
-	//
-	// However, if any instance is under a partial-expanded prefix then
-	// we can't know whether it's still desired or not, and so we'll need
-	// to defer dealing with it to a future plan/apply round.
-	//
-	// We need to compare with the resource instances we can find in the
-	// state, so we'll need to briefly hold the state lock while we inspect
-	// those. The following inline function limits the scope of the lock.
-	orphanAddrs := addrs.MakeSet[addrs.AbsResourceInstance]()
-	maybeOrphanAddrs := addrs.MakeSet[addrs.AbsResourceInstance]()
-	func() {
-		ss := globalCtx.PrevRunState()
-		state := ss.Lock()
-		defer ss.Unlock()
-
-		for _, res := range state.Resources(n.Addr) {
-		Instances:
-			for instKey := range res.Instances {
-				instAddr := res.Addr.Instance(instKey)
-
-				for _, partialAddr := range partialExpandedAddrs {
-					if partialAddr.MatchesInstance(instAddr) {
-						// The instance is beneath a partial-expanded prefix, so
-						// we can't decide yet whether it's an orphan or not,
-						// but we'll still note it so we can make sure to
-						// refresh its state.
-						maybeOrphanAddrs.Add(instAddr)
-						continue Instances
-					}
-				}
-				if !knownAddrs.Has(instAddr) {
-					// If we get here then the instance is not under an
-					// partial-expanded prefix and is not in our set of
-					// fully-known desired state instances, and so it's
-					// an "orphan".
-					orphanAddrs.Add(instAddr)
-				}
-			}
-		}
-	}()
-
-	// TEMP: The code that deals with some other language/workflow features
-	// is not yet updated to be able to handle partial-expanded resource
-	// address prefixes, to constrain the scope of the initial experimental
-	// implementation. We'll reject some of those cases with errors, just to
-	// be explicit that they don't work rather than just quietly doing
-	// something incomplete/broken/strange.
-	if len(partialExpandedAddrs) != 0 {
-		// Some other parts of the system aren't yet able to make sense of
-		// partial-expanded resource addresses, so we'll forbid them for
-		// now and improve on this in later iterations of the experiment.
-		if len(n.Targets) != 0 {
-			diags = diags.Append(tfdiags.Sourceless(
-				tfdiags.Error,
-				"Cannot use resource targeting with unknown count or for_each",
-				"In the current phase of the unknown_instances language experiment, the -target=... planning option is not yet supported whenever unknown count or for_each are present.",
-			))
-		}
-		if len(n.forceReplace) != 0 {
-			diags = diags.Append(tfdiags.Sourceless(
-				tfdiags.Error,
-				"Cannot use forced replacement with unknown count or for_each",
-				"In the current phase of the unknown_instances language experiment, the -replace=... planning option is not yet supported whenever unknown count or for_each are present.",
-			))
-		}
-		if diags.HasErrors() {
-			return nil, diags
-		}
-	}
-
-	// At this point we have four different sets of resource instance
-	// addresses:
-	// - knownAddrs are definitely in the desired state. They may or may not
-	//   also be in the previous run state.
-	// - partialExpandedAddrs are unbounded sets of instances that _might_
-	//   be in the desired state, but we can't know until a future round.
-	// - orphanAddrs are in the previous run state but definitely not in
-	//   the desired state.
-	// - maybeOrphanAddrs are in the previous run state and we can't know
-	//   whether they are in the desired state until a future round.
-	//
-	// Each resource instance in the union of all of the above sets needs to
-	// be represented as part of _some_ graph node, but we'll build them
-	// differently depending on which set they came from.
-	for _, addr := range knownAddrs {
-		log.Printf("[TRACE] nodeExpandPlannableResource: %s is definitely in the desired state", addr)
-		v := &NodePlannableResourceInstance{
-			NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(addr),
-			skipRefresh:                  n.skipRefresh,
-			skipPlanChanges:              n.skipPlanChanges,
-			forceReplace:                 n.forceReplace,
-			// TODO: replaceTriggeredBy?
-			// TODO: importTarget?
-			// TODO: ForceCreateBeforeDestroy?
-		}
-		v.ResolvedProvider = n.ResolvedProvider
-		v.Config = n.Config
-		g.Add(v)
-	}
-	for _, addr := range partialExpandedAddrs {
-		log.Printf("[TRACE] nodeExpandPlannableResource: desired instances matching %s are not yet known", addr)
-		v := &nodePlannablePartialExpandedResource{
-			addr:             addr,
-			config:           n.Config,
-			resolvedProvider: n.ResolvedProvider,
-			skipPlanChanges:  n.skipPlanChanges,
-		}
-		g.Add(v)
-	}
-	for _, addr := range orphanAddrs {
-		log.Printf("[TRACE] nodeExpandPlannableResource: %s is in previous state but no longer desired", addr)
-		v := &NodePlannableResourceInstanceOrphan{
-			NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(addr),
-			skipRefresh:                  n.skipRefresh,
-			skipPlanChanges:              n.skipPlanChanges,
-			// TODO: forgetResources?
-			// TODO: forgetModules?
-		}
-		v.ResolvedProvider = n.ResolvedProvider
-		v.Config = n.Config
-		g.Add(v)
-	}
-	for _, addr := range maybeOrphanAddrs {
-		// For any object in the previous run state where we cannot yet know
-		// if it's an orphan, we can't yet properly plan it but we still
-		// want to refresh it, in the same way we would if this were a
-		// refresh-only plan.
-		log.Printf("[TRACE] nodeExpandPlannableResource: %s is in previous state but unknown whether it's still desired", addr)
-		v := &NodePlannableResourceInstance{
-			NodeAbstractResourceInstance: NewNodeAbstractResourceInstance(addr),
-			skipRefresh:                  n.skipRefresh,
-			skipPlanChanges:              true, // We never plan for a "maybe-orphan"
-			forceReplace:                 n.forceReplace,
-			// TODO: replaceTriggeredBy?
-			// TODO: importTarget?
-			// TODO: ForceCreateBeforeDestroy?
-		}
-		v.ResolvedProvider = n.ResolvedProvider
-		v.Config = n.Config
-		g.Add(v)
-	}
-
-	addRootNodeToGraph(&g)
-	return &g, diags
-}
-
-// validateExpandedImportTargets checks that all expanded imports correspond to
-// a configured instance.
-func (n *nodeExpandPlannableResource) validateExpandedImportTargets() tfdiags.Diagnostics {
-	var diags tfdiags.Diagnostics
-
-	for _, addr := range n.expandedImports {
-		if !n.expandedInstances.Has(addr) {
-			diags = diags.Append(tfdiags.Sourceless(
-				tfdiags.Error,
-				"Configuration for import target does not exist",
-				fmt.Sprintf("The configuration for the given import %s does not exist. All target instances must have an associated configuration to be imported.", addr),
-			))
-			return diags
-		}
-	}
-
-	return diags
 }
 
 // expandResourceInstances calculates the dynamic expansion for the resource
@@ -440,7 +374,7 @@ func (n *nodeExpandPlannableResource) validateExpandedImportTargets() tfdiags.Di
 // within, the caller must register the final superset instAddrs with the
 // checks subsystem so that it knows the fully expanded set of checkable
 // object instances for this resource instance.
-func (n *nodeExpandPlannableResource) expandResourceInstances(globalCtx EvalContext, resAddr addrs.AbsResource, g *Graph) tfdiags.Diagnostics {
+func (n *nodeExpandPlannableResource) expandResourceInstances(globalCtx EvalContext, resAddr addrs.AbsResource, imports addrs.Map[addrs.AbsResourceInstance, cty.Value], g *Graph) ([]addrs.AbsResourceInstance, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// The rest of our work here needs to know which module instance it's
@@ -453,7 +387,7 @@ func (n *nodeExpandPlannableResource) expandResourceInstances(globalCtx EvalCont
 	moreDiags := n.writeResourceState(moduleCtx, resAddr)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {
-		return diags
+		return nil, diags
 	}
 
 	// Before we expand our resource into potentially many resource instances,
@@ -473,170 +407,29 @@ func (n *nodeExpandPlannableResource) expandResourceInstances(globalCtx EvalCont
 		mustHaveIndex = true
 	}
 	if mustHaveIndex {
-		for _, candidateAddr := range n.forceReplace {
-			if candidateAddr.Resource.Key == addrs.NoKey {
-				if n.Addr.Resource.Equal(candidateAddr.Resource.Resource) {
-					switch {
-					case len(instanceAddrs) == 0:
-						// In this case there _are_ no instances to replace, so
-						// there isn't any alternative address for us to suggest.
-						diags = diags.Append(tfdiags.Sourceless(
-							tfdiags.Warning,
-							"Incompletely-matched force-replace resource instance",
-							fmt.Sprintf(
-								"Your force-replace request for %s doesn't match any resource instances because this resource doesn't have any instances.",
-								candidateAddr,
-							),
-						))
-					case len(instanceAddrs) == 1:
-						diags = diags.Append(tfdiags.Sourceless(
-							tfdiags.Warning,
-							"Incompletely-matched force-replace resource instance",
-							fmt.Sprintf(
-								"Your force-replace request for %s doesn't match any resource instances because it lacks an instance key.\n\nTo force replacement of the single declared instance, use the following option instead:\n  -replace=%q",
-								candidateAddr, instanceAddrs[0],
-							),
-						))
-					default:
-						var possibleValidOptions strings.Builder
-						for _, addr := range instanceAddrs {
-							fmt.Fprintf(&possibleValidOptions, "\n  -replace=%q", addr)
-						}
-
-						diags = diags.Append(tfdiags.Sourceless(
-							tfdiags.Warning,
-							"Incompletely-matched force-replace resource instance",
-							fmt.Sprintf(
-								"Your force-replace request for %s doesn't match any resource instances because it lacks an instance key.\n\nTo force replacement of particular instances, use one or more of the following options instead:%s",
-								candidateAddr, possibleValidOptions.String(),
-							),
-						))
-					}
-				}
-			}
-		}
+		diags = diags.Append(n.validForceReplaceTargets(instanceAddrs))
 	}
 	// NOTE: The actual interpretation of n.forceReplace to produce replace
 	// actions is in the per-instance function we're about to call, because
 	// we need to evaluate it on a per-instance basis.
-
-	for _, addr := range instanceAddrs {
-		// If this resource is participating in the "checks" mechanism then our
-		// caller will need to know all of our expanded instance addresses as
-		// checkable object instances.
-		n.expandedInstances.Add(addr)
-	}
 
 	// Our graph builder mechanism expects to always be constructing new
 	// graphs rather than adding to existing ones, so we'll first
 	// construct a subgraph just for this individual modules's instances and
 	// then we'll steal all of its nodes and edges to incorporate into our
 	// main graph which contains all of the resource instances together.
-	instG, instDiags := n.resourceInstanceSubgraph(moduleCtx, resAddr, instanceAddrs)
+	instG, instDiags := n.resourceInstanceSubgraph(moduleCtx, resAddr, instanceAddrs, imports)
 	if instDiags.HasErrors() {
 		diags = diags.Append(instDiags)
-		return diags
+		return nil, diags
 	}
 	g.Subsume(&instG.AcyclicGraph.Graph)
 
-	return diags
+	return instanceAddrs, diags
 }
 
-// Import blocks are expanded in conjunction with their associated resource block.
-func (n nodeExpandPlannableResource) expandResourceImports(ctx EvalContext, addr addrs.AbsResource, instanceAddrs []addrs.AbsResourceInstance) (addrs.Map[addrs.AbsResourceInstance, string], tfdiags.Diagnostics) {
-	// Imports maps the target address to an import ID.
-	imports := addrs.MakeMap[addrs.AbsResourceInstance, string]()
+func (n *nodeExpandPlannableResource) resourceInstanceSubgraph(ctx EvalContext, addr addrs.AbsResource, instanceAddrs []addrs.AbsResourceInstance, imports addrs.Map[addrs.AbsResourceInstance, cty.Value]) (*Graph, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
-
-	if len(n.importTargets) == 0 {
-		return imports, diags
-	}
-
-	// Import blocks are only valid within the root module, and must be
-	// evaluated within that context
-	ctx = evalContextForModuleInstance(ctx, addrs.RootModuleInstance)
-
-	for _, imp := range n.importTargets {
-		if imp.Config == nil {
-			// if we have a legacy addr, it was supplied on the commandline so
-			// there is nothing to expand
-			if !imp.LegacyAddr.Equal(addrs.AbsResourceInstance{}) {
-				imports.Put(imp.LegacyAddr, imp.IDString)
-				n.expandedImports.Add(imp.LegacyAddr)
-				return imports, diags
-			}
-
-			// legacy import tests may have no configuration
-			log.Printf("[WARN] no configuration for import target %#v", imp)
-			continue
-		}
-
-		if imp.Config.ForEach == nil {
-			importID, evalDiags := evaluateImportIdExpression(imp.Config.ID, ctx, EvalDataForNoInstanceKey)
-			diags = diags.Append(evalDiags)
-			if diags.HasErrors() {
-				return imports, diags
-			}
-
-			traversal, hds := hcl.AbsTraversalForExpr(imp.Config.To)
-			diags = diags.Append(hds)
-			to, tds := addrs.ParseAbsResourceInstance(traversal)
-			diags = diags.Append(tds)
-			if diags.HasErrors() {
-				return imports, diags
-			}
-
-			imports.Put(to, importID)
-			n.expandedImports.Add(to)
-
-			log.Printf("[TRACE] expandResourceImports: found single import target %s", to)
-			continue
-		}
-
-		forEachData, forEachDiags := newForEachEvaluator(imp.Config.ForEach, ctx, false).ImportValues()
-		diags = diags.Append(forEachDiags)
-		if forEachDiags.HasErrors() {
-			return imports, diags
-		}
-
-		for _, keyData := range forEachData {
-			res, evalDiags := evalImportToExpression(imp.Config.To, keyData)
-			diags = diags.Append(evalDiags)
-			if diags.HasErrors() {
-				return imports, diags
-			}
-
-			importID, evalDiags := evaluateImportIdExpression(imp.Config.ID, ctx, keyData)
-			diags = diags.Append(evalDiags)
-			if diags.HasErrors() {
-				return imports, diags
-			}
-
-			imports.Put(res, importID)
-			n.expandedImports.Add(res)
-			log.Printf("[TRACE] expandResourceImports: expanded import target %s", res)
-		}
-	}
-
-	// filter out any import which already exist in state
-	state := ctx.State()
-	for _, el := range imports.Elements() {
-		if state.ResourceInstance(el.Key) != nil {
-			log.Printf("[DEBUG] expandResourceImports: skipping import address %s already in state", el.Key)
-			imports.Remove(el.Key)
-		}
-	}
-
-	return imports, diags
-}
-
-func (n *nodeExpandPlannableResource) resourceInstanceSubgraph(ctx EvalContext, addr addrs.AbsResource, instanceAddrs []addrs.AbsResourceInstance) (*Graph, tfdiags.Diagnostics) {
-	var diags tfdiags.Diagnostics
-
-	// Now that the resources are all expanded, we can expand the imports for
-	// this resource.
-	imports, importDiags := n.expandResourceImports(ctx, addr, instanceAddrs)
-	diags = diags.Append(importDiags)
 
 	if n.Config == nil && n.generateConfigPath != "" && imports.Len() == 0 {
 		// We're generating configuration, but there's nothing to import, which
@@ -652,76 +445,11 @@ func (n *nodeExpandPlannableResource) resourceInstanceSubgraph(ctx EvalContext, 
 	state := ctx.State().Lock()
 	defer ctx.State().Unlock()
 
-	// The concrete resource factory we'll use
-	concreteResource := func(a *NodeAbstractResourceInstance) dag.Vertex {
-		var m *NodePlannableResourceInstance
-
-		// If we're in legacy import mode (the import CLI command), we only need
-		// to return the import node, not a plannable resource node.
-		for _, importTarget := range n.importTargets {
-			if importTarget.LegacyAddr.Equal(a.Addr) {
-				return &graphNodeImportState{
-					Addr:             importTarget.LegacyAddr,
-					ID:               imports.Get(importTarget.LegacyAddr),
-					ResolvedProvider: n.ResolvedProvider,
-				}
-			}
-		}
-
-		// Add the config and state since we don't do that via transforms
-		a.Config = n.Config
-		a.ResolvedProvider = n.ResolvedProvider
-		a.Schema = n.Schema
-		a.ProvisionerSchemas = n.ProvisionerSchemas
-		a.ProviderMetas = n.ProviderMetas
-		a.dependsOn = n.dependsOn
-		a.Dependencies = n.dependencies
-		a.preDestroyRefresh = n.preDestroyRefresh
-		a.generateConfigPath = n.generateConfigPath
-
-		m = &NodePlannableResourceInstance{
-			NodeAbstractResourceInstance: a,
-
-			// By the time we're walking, we've figured out whether we need
-			// to force on CreateBeforeDestroy due to dependencies on other
-			// nodes that have it.
-			ForceCreateBeforeDestroy: n.CreateBeforeDestroy(),
-			skipRefresh:              n.skipRefresh,
-			skipPlanChanges:          n.skipPlanChanges,
-			forceReplace:             n.forceReplace,
-		}
-
-		importID, ok := imports.GetOk(a.Addr)
-		if ok {
-			m.importTarget = ImportTarget{
-				IDString: importID,
-			}
-		}
-
-		return m
-	}
-
-	// The concrete resource factory we'll use for orphans
-	concreteResourceOrphan := func(a *NodeAbstractResourceInstance) dag.Vertex {
-		// Add the config and state since we don't do that via transforms
-		a.Config = n.Config
-		a.ResolvedProvider = n.ResolvedProvider
-		a.Schema = n.Schema
-		a.ProvisionerSchemas = n.ProvisionerSchemas
-		a.ProviderMetas = n.ProviderMetas
-
-		return &NodePlannableResourceInstanceOrphan{
-			NodeAbstractResourceInstance: a,
-			skipRefresh:                  n.skipRefresh,
-			skipPlanChanges:              n.skipPlanChanges,
-		}
-	}
-
 	// Start creating the steps
 	steps := []GraphTransformer{
 		// Expand the count or for_each (if present)
 		&ResourceCountTransformer{
-			Concrete:      concreteResource,
+			Concrete:      n.concreteResource(ctx, imports, addrs.MakeMap[addrs.PartialExpandedResource, addrs.Set[addrs.AbsResourceInstance]](), n.skipPlanChanges),
 			Schema:        n.Schema,
 			Addr:          n.ResourceAddr(),
 			InstanceAddrs: instanceAddrs,
@@ -729,7 +457,7 @@ func (n *nodeExpandPlannableResource) resourceInstanceSubgraph(ctx EvalContext, 
 
 		// Add the count/for_each orphans
 		&OrphanResourceInstanceCountTransformer{
-			Concrete:      concreteResourceOrphan,
+			Concrete:      n.concreteResourceOrphan,
 			Addr:          addr,
 			InstanceAddrs: instanceAddrs,
 			State:         state,
@@ -757,4 +485,142 @@ func (n *nodeExpandPlannableResource) resourceInstanceSubgraph(ctx EvalContext, 
 	diags = diags.Append(graphDiags)
 
 	return graph, diags
+}
+
+func (n *nodeExpandPlannableResource) concreteResource(ctx EvalContext, knownImports addrs.Map[addrs.AbsResourceInstance, cty.Value], unknownImports addrs.Map[addrs.PartialExpandedResource, addrs.Set[addrs.AbsResourceInstance]], skipPlanChanges bool) func(*NodeAbstractResourceInstance) dag.Vertex {
+	return func(a *NodeAbstractResourceInstance) dag.Vertex {
+		var m *NodePlannableResourceInstance
+
+		// If we're in legacy import mode (the import CLI command), we only need
+		// to return the import node, not a plannable resource node.
+		for _, importTarget := range n.importTargets {
+			if importTarget.LegacyAddr.Equal(a.Addr) {
+
+				// If we're in the legacy import mode, then we should never
+				// see unknown imports. So, it's fine to just look at the known
+				// imports here.
+				idValue := knownImports.Get(importTarget.LegacyAddr)
+
+				return &graphNodeImportState{
+					Addr:             importTarget.LegacyAddr,
+					ID:               idValue.AsString(),
+					ResolvedProvider: n.ResolvedProvider,
+				}
+			}
+		}
+
+		// Add the config and state since we don't do that via transforms
+		a.Config = n.Config
+		a.ResolvedProvider = n.ResolvedProvider
+		a.Schema = n.Schema
+		a.ProvisionerSchemas = n.ProvisionerSchemas
+		a.ProviderMetas = n.ProviderMetas
+		a.dependsOn = n.dependsOn
+		a.Dependencies = n.dependencies
+		a.preDestroyRefresh = n.preDestroyRefresh
+		a.generateConfigPath = n.generateConfigPath
+
+		m = &NodePlannableResourceInstance{
+			NodeAbstractResourceInstance: a,
+
+			// By the time we're walking, we've figured out whether we need
+			// to force on CreateBeforeDestroy due to dependencies on other
+			// nodes that have it.
+			ForceCreateBeforeDestroy: n.CreateBeforeDestroy(),
+			skipRefresh:              n.skipRefresh,
+			skipPlanChanges:          skipPlanChanges,
+			forceReplace:             n.forceReplace,
+		}
+
+		if importID, ok := knownImports.GetOk(a.Addr); ok {
+			m.importTarget = importID
+		} else {
+			// We're going to check now if this resource instance *might* be
+			// targeted by one of the unknown imports. If it is, we'll set the
+			// import target to an unknown value so that the import operation
+			// will be deferred.
+			for _, unknownImport := range unknownImports.Elems {
+				if unknownImport.Key.MatchesInstance(a.Addr) {
+					if unknownImport.Value.Has(a.Addr) {
+						// This means that this particular instance already
+						// exists within the state. `import` blocks that target
+						// instances that already exist are ignored by
+						// Terraform. This means that even if this unknown
+						// import does eventually resolve to this instance then
+						// it would be ignored anyway. So for this instance we
+						// won't set the import target.
+						continue
+					}
+
+					m.importTarget = cty.UnknownVal(cty.String)
+				}
+			}
+		}
+
+		return m
+	}
+}
+
+func (n *nodeExpandPlannableResource) concreteResourceOrphan(a *NodeAbstractResourceInstance) dag.Vertex {
+	// Add the config and state since we don't do that via transforms
+	a.Config = n.Config
+	a.ResolvedProvider = n.ResolvedProvider
+	a.Schema = n.Schema
+	a.ProvisionerSchemas = n.ProvisionerSchemas
+	a.ProviderMetas = n.ProviderMetas
+
+	return &NodePlannableResourceInstanceOrphan{
+		NodeAbstractResourceInstance: a,
+		skipRefresh:                  n.skipRefresh,
+		skipPlanChanges:              n.skipPlanChanges,
+	}
+}
+
+func (n *nodeExpandPlannableResource) validForceReplaceTargets(instanceAddrs []addrs.AbsResourceInstance) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	for _, candidateAddr := range n.forceReplace {
+		if candidateAddr.Resource.Key == addrs.NoKey {
+			if n.Addr.Resource.Equal(candidateAddr.Resource.Resource) {
+				switch {
+				case len(instanceAddrs) == 0:
+					// In this case there _are_ no instances to replace, so
+					// there isn't any alternative address for us to suggest.
+					diags = diags.Append(tfdiags.Sourceless(
+						tfdiags.Warning,
+						"Incompletely-matched force-replace resource instance",
+						fmt.Sprintf(
+							"Your force-replace request for %s doesn't match any resource instances because this resource doesn't have any instances.",
+							candidateAddr,
+						),
+					))
+				case len(instanceAddrs) == 1:
+					diags = diags.Append(tfdiags.Sourceless(
+						tfdiags.Warning,
+						"Incompletely-matched force-replace resource instance",
+						fmt.Sprintf(
+							"Your force-replace request for %s doesn't match any resource instances because it lacks an instance key.\n\nTo force replacement of the single declared instance, use the following option instead:\n  -replace=%q",
+							candidateAddr, instanceAddrs[0],
+						),
+					))
+				default:
+					var possibleValidOptions strings.Builder
+					for _, addr := range instanceAddrs {
+						fmt.Fprintf(&possibleValidOptions, "\n  -replace=%q", addr)
+					}
+
+					diags = diags.Append(tfdiags.Sourceless(
+						tfdiags.Warning,
+						"Incompletely-matched force-replace resource instance",
+						fmt.Sprintf(
+							"Your force-replace request for %s doesn't match any resource instances because it lacks an instance key.\n\nTo force replacement of particular instances, use one or more of the following options instead:%s",
+							candidateAddr, possibleValidOptions.String(),
+						),
+					))
+				}
+			}
+		}
+	}
+
+	return diags
 }

@@ -13,14 +13,26 @@ service Setup {
     //
     // This function can be called only once per RPC server.
     rpc Handshake(Handshake.Request) returns (Handshake.Response);
+
+    // At any time after handshaking, clients may call Stop to initiate a
+    // graceful shutdown of the server.
+    rpc Stop(Stop.Request) returns (Stop.Response);
 }
 
 message Handshake {
     message Request {
         ClientCapabilities capabilities = 1;
+        Config config = 2;
     }
     message Response {
         ServerCapabilities capabilities = 2;
+    }
+}
+
+message Stop {
+    message Request {
+    }
+    message Response {
     }
 }
 
@@ -110,6 +122,14 @@ service Dependencies {
     // has the potential to run in a context that probably has access to
     // private source code and other sensitive information.
     rpc GetProviderSchema(GetProviderSchema.Request) returns (GetProviderSchema.Response);
+}
+
+message Config {
+    map<string, HostCredential> credentials = 1;
+}
+
+message HostCredential {
+    string token = 1;
 }
 
 message OpenSourceBundle {
@@ -462,6 +482,8 @@ message FindStackConfigurationComponents {
     message StackConfig {
         map<string, Component> components = 1;
         map<string, EmbeddedStack> embedded_stacks = 2;
+        map<string, InputVariable> input_variables = 3;
+        map<string, OutputValue> output_values = 4;
     }
     message EmbeddedStack {
         string source_addr = 1;
@@ -472,6 +494,15 @@ message FindStackConfigurationComponents {
         string source_addr = 1;
         Instances instances = 2;
         string component_addr = 3;
+    }
+    message InputVariable {
+        bool optional = 1;
+        bool sensitive = 2;
+        bool ephemeral = 3;
+    }
+    message OutputValue {
+        bool sensitive = 1;
+        bool ephemeral = 2;
     }
 }
 
@@ -518,6 +549,14 @@ message ApplyStackChanges {
         // This must be equivalent to the argument of the same name
         // passed to PlanStackChanges when creating this plan.
         int64 provider_cache_handle = 6;
+
+        // Any input variables identified as an "apply-time input variable"
+        // in the plan must have values provided here.
+        //
+        // Callers may also optionally include values for other declared input
+        // variables, but if so their values must exactly match those used when
+        // creating the plan.
+        map<string, DynamicValueWithSource> input_values = 7;
 
         reserved 2; // (formerly the previous state, but we now propagate that as part of planned_changes as an implementation detail)
     }
@@ -672,6 +711,7 @@ enum ChangeType {
     CREATE = 2;
     UPDATE = 3;
     DELETE = 4;
+    FORGET = 5;
 }
 
 // Describes one item in a stack plan. The overall plan is the concatentation
@@ -728,6 +768,8 @@ message PlannedChange {
             ResourceInstance resource_instance_planned = 2;
             OutputValue output_value_planned = 3;
             bool plan_applyable = 4;
+            ResourceInstanceDeferred resource_instance_deferred = 5;
+            InputVariableDuringApply apply_time_input_variable = 6;
         }
     }
 
@@ -796,6 +838,7 @@ message PlannedChange {
         }
         message Imported {
             string import_id = 1;
+            bool unknown = 2;
         }
     }
     // Note: this is only for output values from the topmost
@@ -806,6 +849,37 @@ message PlannedChange {
         repeated ChangeType actions = 2;
         DynamicValueChange values = 3;
     }
+
+    message ResourceInstanceDeferred {
+        ResourceInstance resource_instance = 1;
+        Deferred deferred = 2;
+    }
+
+    // Describes an input variable that must have a value provided
+    // during the apply phase.
+    //
+    // This currently arises only when the variable was declared
+    // as ephemeral and was set to a non-null value during the planning
+    // phase.
+    message InputVariableDuringApply {
+        string name = 1;
+    }
+}
+
+// Deferred contains all the metadata about a the deferral of a resource
+// instance change.
+message Deferred {
+    // Reason describes the reason why a resource instance change was
+    // deferred.
+    enum Reason {
+        INVALID = 0;
+        INSTANCE_COUNT_UNKNOWN = 1;
+        RESOURCE_CONFIG_UNKNOWN = 2;
+        PROVIDER_CONFIG_UNKNOWN = 3;
+        ABSENT_PREREQ = 4;
+        DEFERRED_PREREQ = 5;
+    }
+    Reason reason = 1;
 }
 
 // Describes a change made during a Stacks.ApplyStackChanges call.
@@ -882,7 +956,8 @@ message AppliedChange {
     message ChangeDescription {
         string key = 1;
         oneof description {
-            Nothing deleted = 4; // explicitly represents the absense of a description
+            Nothing deleted = 4; // explicitly represents the absence of a description
+            Nothing moved = 6; // explicitly represents the absence of a description
             ResourceInstance resource_instance = 2;
             OutputValue output_value = 3;
             ComponentInstance component_instance = 5;
@@ -949,6 +1024,7 @@ message StackChangeProgress {
         ProvisionerOutput provisioner_output = 5;
         ComponentInstanceChanges component_instance_changes = 6;
         ComponentInstances component_instances = 7;
+        DeferredResourceInstancePlannedChange deferred_resource_instance_planned_change = 8;
     }
 
     // ComponentInstanceStatus describes the current status of a component instance
@@ -1005,7 +1081,15 @@ message StackChangeProgress {
         }
         message Imported {
             string import_id = 1;
+            bool unknown = 2;
         }
+    }
+
+    // DeferredResourceInstancePlannedChange represents a planned change for a
+    // resource instance that is deferred due to the reason provided.
+    message DeferredResourceInstancePlannedChange {
+        Deferred deferred = 1;
+        ResourceInstancePlannedChange change = 2;
     }
 
     // ProvisionerStatus represents the progress of a given provisioner during its
@@ -1048,6 +1132,9 @@ message StackChangeProgress {
         int32 change = 4;
         int32 import = 5;
         int32 remove = 6;
+        int32 defer = 7;
+        int32 move = 8;
+        int32 forget = 9;
     }
 
     // ComponentInstances represents the result of expanding a component into zero

@@ -168,10 +168,7 @@ func (c *Context) graphWalker(graph *Graph, operation walkOperation, opts *graph
 		}
 	}
 
-	// We'll produce a derived graph that only includes the static resource
-	// blocks, since we need that for deferral tracking.
-	resourceGraph := graph.ResourceGraph()
-	deferred := deferring.NewDeferred(resourceGraph, opts.DeferralAllowed)
+	deferred := deferring.NewDeferred(opts.DeferralAllowed)
 	if opts.ExternalDependencyDeferred {
 		deferred.SetExternalDependencyDeferred()
 	}
@@ -187,7 +184,7 @@ func (c *Context) graphWalker(graph *Graph, operation walkOperation, opts *graph
 		NamedValues:             namedvals.NewState(),
 		Deferrals:               deferred,
 		Checks:                  checkState,
-		InstanceExpander:        instances.NewExpander(),
+		InstanceExpander:        instances.NewExpander(opts.Overrides),
 		ExternalProviderConfigs: opts.ExternalProviderConfigs,
 		MoveResults:             opts.MoveResults,
 		Operation:               operation,

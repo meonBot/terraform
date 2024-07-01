@@ -16,7 +16,6 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	fileProvisioner "github.com/hashicorp/terraform/internal/builtin/provisioners/file"
 	remoteExecProvisioner "github.com/hashicorp/terraform/internal/builtin/provisioners/remote-exec"
-	"github.com/hashicorp/terraform/internal/instances"
 	"github.com/hashicorp/terraform/internal/promising"
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
@@ -91,10 +90,6 @@ type mainValidating struct {
 type mainPlanning struct {
 	opts      PlanOpts
 	prevState *stackstate.State
-
-	// This is a utility for unit tests that want to encourage stable output
-	// to assert against. Not for real use.
-	forcePlanTimestamp *time.Time
 }
 
 type mainApplying struct {
@@ -387,40 +382,6 @@ func (m *Main) ProviderRefTypes() map[addrs.Provider]cty.Type {
 	return m.config.ProviderRefTypes
 }
 
-// ProviderInstance returns the provider instance with the given address,
-// or nil if there is no such provider instance.
-//
-// This function needs to evaluate the for_each expression of each stack along
-// the path and of a final multi-instance provider configuration, and so will
-// block on whatever those expressions depend on.
-//
-// If any of the objects along the path have an as-yet-unknown set of
-// instances, this function will optimistically return a non-nil provider
-// configuration but further operations with that configuration are likely
-// to return unknown values themselves.
-func (m *Main) ProviderInstance(ctx context.Context, addr stackaddrs.AbsProviderConfigInstance, phase EvalPhase) *ProviderInstance {
-	stack := m.Stack(ctx, addr.Stack, phase)
-	if stack == nil {
-		return nil
-	}
-	provider := stack.Provider(ctx, addr.Item.ProviderConfig)
-	if provider == nil {
-		return nil
-	}
-	insts := provider.Instances(ctx, phase)
-	if insts == nil {
-		// A nil result means that the for_each expression is unknown, and
-		// so we must optimistically return an instance referring to the
-		// given address which will then presumably yield unknown values
-		// of some kind when used.
-		return newProviderInstance(provider, addr.Item.Key, instances.RepetitionData{
-			EachKey:   cty.UnknownVal(cty.String),
-			EachValue: cty.DynamicVal,
-		})
-	}
-	return insts[addr.Item.Key]
-}
-
 // PreviousProviderInstances fetches the set of providers that are required
 // based on the current plan or state file. They are previous in the sense that
 // they're not based on the current config. So if a provider has been removed
@@ -596,6 +557,12 @@ func (m *Main) reportNamedPromises(cb func(id promising.PromiseID, name string))
 	if m.mainStackConfig != nil {
 		m.mainStackConfig.reportNamedPromises(cb)
 	}
+	if m.mainStack != nil {
+		m.mainStack.reportNamedPromises(cb)
+	}
+	for _, pty := range m.providerTypes {
+		pty.reportNamedPromises(cb)
+	}
 }
 
 // availableProvisioners returns the table of provisioner factories that should
@@ -625,4 +592,20 @@ func (m *Main) availableProvisioners() map[string]provisioners.Factory {
 			return nil, fmt.Errorf("local-exec provisioners are not supported in stack components; use provider functionality or remote provisioners instead")
 		},
 	}
+}
+
+// PlanTimestamp provides the timestamp at which the plan
+// associated with this operation is being executed.
+// If we are planning we either take the forced timestamp or the saved current time
+// If we are applying we take the timestamp time from the plan
+func (m *Main) PlanTimestamp() time.Time {
+	if m.applying != nil {
+		return m.applying.plan.PlanTimestamp
+	}
+	if m.planning != nil {
+		return m.planning.opts.PlanTimestamp
+	}
+
+	// This is the default case, we are not planning / applying
+	return time.Now().UTC()
 }

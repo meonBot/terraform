@@ -14,6 +14,8 @@ import (
 // NodeApplyableResource nodes into their respective modules.
 type nodeExpandApplyableResource struct {
 	*NodeAbstractResource
+
+	PartialExpansions []addrs.PartialExpandedResource
 }
 
 var (
@@ -49,7 +51,7 @@ func (n *nodeExpandApplyableResource) Name() string {
 func (n *nodeExpandApplyableResource) Execute(globalCtx EvalContext, op walkOperation) tfdiags.Diagnostics {
 	var diags tfdiags.Diagnostics
 	expander := globalCtx.InstanceExpander()
-	moduleInstances := expander.ExpandModule(n.Addr.Module)
+	moduleInstances := expander.ExpandModule(n.Addr.Module, false)
 	for _, module := range moduleInstances {
 		moduleCtx := evalContextForModuleInstance(globalCtx, module)
 		diags = diags.Append(n.writeResourceState(moduleCtx, n.Addr.Resource.Absolute(module)))

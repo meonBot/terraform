@@ -6,11 +6,15 @@ package stackeval
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
+	"github.com/zclconf/go-cty-debug/ctydebug"
 	"github.com/zclconf/go-cty/cty"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -24,6 +28,7 @@ import (
 	providerTesting "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
+	stacks_testing_provider "github.com/hashicorp/terraform/internal/stacks/stackruntime/testing"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate/statekeys"
 	"github.com/hashicorp/terraform/internal/stacks/tfstackdata1"
@@ -154,7 +159,8 @@ func TestPlanning_DestroyMode(t *testing.T) {
 		},
 	}
 	main := NewForPlanning(cfg, priorState, PlanOpts{
-		PlanningMode: plans.DestroyMode,
+		PlanningMode:  plans.DestroyMode,
+		PlanTimestamp: time.Now().UTC(),
 		ProviderFactories: ProviderFactories{
 			addrs.NewBuiltInProvider("test"): func() (providers.Interface, error) {
 				return &providerTesting.MockProvider{
@@ -364,6 +370,7 @@ func TestPlanning_RequiredComponents(t *testing.T) {
 				}, nil
 			},
 		},
+		PlanTimestamp: time.Now().UTC(),
 	})
 
 	cmpA := stackaddrs.AbsComponent{
@@ -592,13 +599,8 @@ func TestPlanning_DeferredChangesPropagation(t *testing.T) {
 
 	cfg := testStackConfig(t, "planning", "deferred_changes_propagation")
 	main := NewForPlanning(cfg, stackstate.NewState(), PlanOpts{
-		PlanningMode: plans.NormalMode,
-		// TEMP: Currently there's no way in normal operation to set this to
-		// true in the PlanOpts, because it would regress other features. So,
-		// the test has to set it manually. In the future, deferred actions will
-		// always be enabled for stacks, and we'll remove this option from the
-		// stackeval.PlanOpts struct.
-		DeferralAllowed: true,
+		PlanningMode:  plans.NormalMode,
+		PlanTimestamp: time.Now().UTC(),
 		InputVariableValues: map[stackaddrs.InputVariable]ExternalInputValue{
 			// This causes the first component to have a module whose
 			// instance count isn't known yet.
@@ -747,6 +749,7 @@ func TestPlanning_RemoveDataResource(t *testing.T) {
 			main := NewForPlanning(cfg, stackstate.NewState(), PlanOpts{
 				PlanningMode:      plans.NormalMode,
 				ProviderFactories: providerFactories,
+				PlanTimestamp:     time.Now().UTC(),
 			})
 			outp, outpTest := testPlanOutput(t)
 			main.PlanAll(ctx, outp)
@@ -803,6 +806,7 @@ func TestPlanning_RemoveDataResource(t *testing.T) {
 			main := NewForPlanning(cfg, state, PlanOpts{
 				PlanningMode:      plans.NormalMode,
 				ProviderFactories: providerFactories,
+				PlanTimestamp:     time.Now().UTC(),
 			})
 			outp, outpTest := testPlanOutput(t)
 			main.PlanAll(ctx, outp)
@@ -882,6 +886,68 @@ func TestPlanning_RemoveDataResource(t *testing.T) {
 	}
 }
 
+func TestPlanning_PathValues(t *testing.T) {
+	cfg := testStackConfig(t, "planning", "path_values")
+	main := NewForPlanning(cfg, stackstate.NewState(), PlanOpts{
+		PlanningMode:  plans.NormalMode,
+		PlanTimestamp: time.Now().UTC(),
+	})
+
+	inPromisingTask(t, func(ctx context.Context, t *testing.T) {
+		plan, diags := testPlan(t, main)
+		if len(diags) > 0 {
+			t.Fatalf("unexpected diagnostics: %s", diags)
+		}
+
+		component, ok := plan.Components.GetOk(stackaddrs.AbsComponentInstance{
+			Stack: stackaddrs.RootStackInstance,
+			Item: stackaddrs.ComponentInstance{
+				Component: stackaddrs.Component{
+					Name: "path_values",
+				},
+				Key: addrs.NoKey,
+			},
+		})
+		if !ok {
+			t.Fatalf("component not found in plan")
+		}
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("failed to get current working directory: %s", err)
+		}
+
+		normalizePath := func(path string) string {
+			rel, err := filepath.Rel(cwd, path)
+			if err != nil {
+				t.Errorf("rel(%s,%s): %s", cwd, path, err)
+				return path
+			}
+			return rel
+		}
+
+		expected := map[string]string{
+			"cwd":          ".",
+			"root":         "testdata/sourcebundle/planning/path_values/module",       // this is the root module of the component
+			"module":       "testdata/sourcebundle/planning/path_values/module",       // this is the root module
+			"child_root":   "testdata/sourcebundle/planning/path_values/module",       // should be the same for all modules
+			"child_module": "testdata/sourcebundle/planning/path_values/module/child", // this is the child module
+		}
+
+		actual := map[string]string{
+			"cwd":          normalizePath(component.PlannedOutputValues[addrs.OutputValue{Name: "cwd"}].AsString()),
+			"root":         normalizePath(component.PlannedOutputValues[addrs.OutputValue{Name: "root"}].AsString()),
+			"module":       normalizePath(component.PlannedOutputValues[addrs.OutputValue{Name: "module"}].AsString()),
+			"child_root":   normalizePath(component.PlannedOutputValues[addrs.OutputValue{Name: "child_root"}].AsString()),
+			"child_module": normalizePath(component.PlannedOutputValues[addrs.OutputValue{Name: "child_module"}].AsString()),
+		}
+
+		if cmp.Diff(expected, actual) != "" {
+			t.Fatalf("unexpected path values\n%s", cmp.Diff(expected, actual))
+		}
+	})
+}
+
 func TestPlanning_NoWorkspaceNameRef(t *testing.T) {
 	// This test verifies that a reference to terraform.workspace is treated
 	// as invalid for modules used in a stacks context, because there's
@@ -921,4 +987,118 @@ func TestPlanning_NoWorkspaceNameRef(t *testing.T) {
 			t.Fatalf("none of the error diagnostics mentions terraform.workspace\n%s", spew.Sdump(diags.ForRPC()))
 		}
 	})
+}
+
+func TestPlanning_Locals(t *testing.T) {
+	cfg := testStackConfig(t, "local_value", "basics")
+	main := NewForPlanning(cfg, stackstate.NewState(), PlanOpts{
+		PlanningMode: plans.NormalMode,
+	})
+
+	inPromisingTask(t, func(ctx context.Context, t *testing.T) {
+		_, diags := testPlan(t, main)
+		if diags.HasErrors() {
+			t.Fatalf("errors encountered\n%s", spew.Sdump(diags.ForRPC()))
+		}
+	})
+}
+
+func TestPlanning_LocalsDataSource(t *testing.T) {
+	ctx := context.Background()
+	cfg := testStackConfig(t, "local_value", "custom_provider")
+	providerFactories := map[addrs.Provider]providers.Factory{
+		addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+			provider := stacks_testing_provider.NewProvider()
+			return provider, nil
+		},
+	}
+
+	main := NewForPlanning(cfg, stackstate.NewState(), PlanOpts{
+		PlanningMode:      plans.NormalMode,
+		ProviderFactories: providerFactories,
+		PlanTimestamp:     time.Now().UTC(),
+	})
+
+	comp2Addr := stackaddrs.AbsComponentInstance{
+		Stack: stackaddrs.RootStackInstance,
+		Item: stackaddrs.ComponentInstance{
+			Component: stackaddrs.Component{Name: "child2"},
+		},
+	}
+
+	rawPlan, err := promising.MainTask(ctx, func(ctx context.Context) ([]*anypb.Any, error) {
+		outp, outpTest := testPlanOutput(t)
+		main.PlanAll(ctx, outp)
+		rawPlan := outpTest.RawChanges(t)
+		_, diags := outpTest.Close(t)
+		assertNoDiagnostics(t, diags)
+		return rawPlan, nil
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = promising.MainTask(ctx, func(ctx context.Context) (*stackstate.State, error) {
+		outp, outpTest := testApplyOutput(t, nil)
+		_, err := ApplyPlan(ctx, cfg, rawPlan, ApplyOpts{
+			ProviderFactories: providerFactories,
+		}, outp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, diags := outpTest.Close(t)
+		applies := outpTest.AppliedChanges()
+		for _, apply := range applies {
+			switch v := apply.(type) {
+			case *stackstate.AppliedChangeComponentInstance:
+				if v.ComponentAddr.Item.Name == comp2Addr.Item.Component.Name {
+					stringKey := addrs.OutputValue{
+						Name: "bar",
+					}
+					listKey := addrs.OutputValue{
+						Name: "list",
+					}
+					mapKey := addrs.OutputValue{
+						Name: "map",
+					}
+
+					stringOutput := v.OutputValues[stringKey]
+					listOutput := v.OutputValues[listKey].AsValueSlice()
+					mapOutput := v.OutputValues[mapKey].AsValueMap()
+
+					expectedString := cty.StringVal("through-local-aloha-foo-foo")
+					expectedList := []cty.Value{
+						cty.StringVal("through-local-aloha-foo"),
+						cty.StringVal("foo")}
+
+					expectedMap := map[string]cty.Value{
+						"key":   cty.StringVal("through-local-aloha-foo"),
+						"value": cty.StringVal("foo"),
+					}
+
+					if cmp.Diff(stringOutput, expectedString, ctydebug.CmpOptions) != "" {
+						t.Fatalf("string output is wrong, expected %q", expectedString.AsString())
+					}
+
+					if cmp.Diff(listOutput, expectedList, ctydebug.CmpOptions) != "" {
+						t.Fatalf("list output is wrong, expected \n%+v,\ngot\n%+v", expectedList, listOutput)
+					}
+
+					if cmp.Diff(mapOutput, expectedMap, ctydebug.CmpOptions) != "" {
+						t.Fatalf("map output is wrong, expected \n%+v,\ngot\n%+v", expectedMap, mapOutput)
+					}
+				}
+			default:
+				break
+			}
+		}
+		assertNoDiagnostics(t, diags)
+
+		return state, nil
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
 }

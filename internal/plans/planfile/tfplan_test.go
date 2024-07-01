@@ -12,9 +12,10 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/lang/globalref"
-	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/plans"
+	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 )
 
@@ -22,6 +23,8 @@ func TestTFPlanRoundTrip(t *testing.T) {
 	objTy := cty.Object(map[string]cty.Type{
 		"id": cty.String,
 	})
+	applyTimeVariables := collections.NewSetCmp[string]()
+	applyTimeVariables.Add("bar")
 
 	plan := &plans.Plan{
 		Applyable: true,
@@ -29,6 +32,7 @@ func TestTFPlanRoundTrip(t *testing.T) {
 		VariableValues: map[string]plans.DynamicValue{
 			"foo": mustNewDynamicValueStr("foo value"),
 		},
+		ApplyTimeVariables: applyTimeVariables,
 		Changes: &plans.Changes{
 			Outputs: []*plans.OutputChangeSrc{
 				{
@@ -89,11 +93,8 @@ func TestTFPlanRoundTrip(t *testing.T) {
 								cty.StringVal("honk"),
 							}),
 						}), objTy),
-						AfterValMarks: []cty.PathValueMarks{
-							{
-								Path:  cty.GetAttrPath("boop").IndexInt(1),
-								Marks: cty.NewValueMarks(marks.Sensitive),
-							},
+						AfterSensitivePaths: []cty.Path{
+							cty.GetAttrPath("boop").IndexInt(1),
 						},
 					},
 					RequiredReplace: cty.NewPathSet(
@@ -184,24 +185,50 @@ func TestTFPlanRoundTrip(t *testing.T) {
 							cty.StringVal("bonk"),
 						}),
 					}), objTy),
-					AfterValMarks: []cty.PathValueMarks{
-						{
-							Path:  cty.GetAttrPath("boop").IndexInt(1),
-							Marks: cty.NewValueMarks(marks.Sensitive),
-						},
+					AfterSensitivePaths: []cty.Path{
+						cty.GetAttrPath("boop").IndexInt(1),
 					},
 				},
 			},
 		},
 		DeferredResources: []*plans.DeferredResourceInstanceChangeSrc{
 			{
-				DeferredReason: plans.DeferredReasonInstanceCountUnknown,
+				DeferredReason: providers.DeferredReasonInstanceCountUnknown,
 				ChangeSrc: &plans.ResourceInstanceChangeSrc{
 					Addr: addrs.Resource{
 						Mode: addrs.ManagedResourceMode,
 						Type: "test_thing",
 						Name: "woot",
 					}.Instance(addrs.WildcardKey).Absolute(addrs.RootModuleInstance),
+					ProviderAddr: addrs.AbsProviderConfig{
+						Provider: addrs.NewDefaultProvider("test"),
+						Module:   addrs.RootModule,
+					},
+					ChangeSrc: plans.ChangeSrc{
+						Action: plans.Create,
+						After: mustNewDynamicValue(cty.ObjectVal(map[string]cty.Value{
+							"id": cty.UnknownVal(cty.String),
+							"boop": cty.ListVal([]cty.Value{
+								cty.StringVal("beep"),
+								cty.StringVal("bonk"),
+							}),
+						}), objTy),
+					},
+				},
+			},
+			{
+				DeferredReason: providers.DeferredReasonInstanceCountUnknown,
+				ChangeSrc: &plans.ResourceInstanceChangeSrc{
+					Addr: addrs.Resource{
+						Mode: addrs.ManagedResourceMode,
+						Type: "test_thing",
+						Name: "woot",
+					}.Instance(addrs.WildcardKey).Absolute(addrs.ModuleInstance{
+						addrs.ModuleInstanceStep{
+							Name:        "mod",
+							InstanceKey: addrs.WildcardKey,
+						},
+					}),
 					ProviderAddr: addrs.AbsProviderConfig{
 						Provider: addrs.NewDefaultProvider("test"),
 						Module:   addrs.RootModule,

@@ -7,25 +7,25 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty-debug/ctydebug"
 	"github.com/zclconf/go-cty/cty"
 
-	// "github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
-	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
-
-	// "github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
+	testing_provider "github.com/hashicorp/terraform/internal/providers/testing"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -200,11 +200,8 @@ data "test_data_source" "foo" {
 		&states.ResourceInstanceObjectSrc{
 			Status:    states.ObjectReady,
 			AttrsJSON: []byte(`{"id":"data_id", "foo":[{"bar":"baz"}]}`),
-			AttrSensitivePaths: []cty.PathValueMarks{
-				{
-					Path:  cty.GetAttrPath("foo"),
-					Marks: cty.NewValueMarks(marks.Sensitive),
-				},
+			AttrSensitivePaths: []cty.Path{
+				cty.GetAttrPath("foo"),
 			},
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
@@ -1303,6 +1300,71 @@ func TestContext2Plan_movedResourceBasic(t *testing.T) {
 			t.Errorf("wrong planned action\ngot:  %s\nwant: %s", got, want)
 		}
 		if got, want := instPlan.ActionReason, plans.ResourceInstanceChangeNoReason; got != want {
+			t.Errorf("wrong action reason\ngot:  %s\nwant: %s", got, want)
+		}
+	})
+}
+
+func TestContext2Plan_movedResourceMissingModule(t *testing.T) {
+	addrA := mustResourceInstanceAddr("test_object.a")
+	addrB := mustResourceInstanceAddr("module.gone.test_object.b")
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			moved {
+				from = test_object.a
+				to   = module.gone.test_object.b
+			}
+		`,
+	})
+
+	state := states.BuildState(func(s *states.SyncState) {
+		// The prior state tracks test_object.a, which we should treat as
+		// test_object.b because of the "moved" block in the config.
+		s.SetResourceInstanceCurrent(addrA, &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	p := simpleMockProvider()
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		Mode: plans.NormalMode,
+		ForceReplace: []addrs.AbsResourceInstance{
+			addrA,
+		},
+	})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	t.Run(addrA.String(), func(t *testing.T) {
+		instPlan := plan.Changes.ResourceInstance(addrA)
+		if instPlan != nil {
+			t.Fatalf("unexpected plan for %s; should've moved to %s", addrA, addrB)
+		}
+	})
+	t.Run(addrB.String(), func(t *testing.T) {
+		instPlan := plan.Changes.ResourceInstance(addrB)
+		if instPlan == nil {
+			t.Fatalf("no plan for %s at all", addrB)
+		}
+
+		if got, want := instPlan.Addr, addrB; !got.Equal(want) {
+			t.Errorf("wrong current address\ngot:  %s\nwant: %s", got, want)
+		}
+		if got, want := instPlan.PrevRunAddr, addrA; !got.Equal(want) {
+			t.Errorf("wrong previous run address\ngot:  %s\nwant: %s", got, want)
+		}
+		if got, want := instPlan.Action, plans.Delete; got != want {
+			t.Errorf("wrong planned action\ngot:  %s\nwant: %s", got, want)
+		}
+		if got, want := instPlan.ActionReason, plans.ResourceInstanceDeleteBecauseNoMoveTarget; got != want {
 			t.Errorf("wrong action reason\ngot:  %s\nwant: %s", got, want)
 		}
 	})
@@ -2640,11 +2702,8 @@ data "test_data_source" "foo" {
 		&states.ResourceInstanceObjectSrc{
 			Status:    states.ObjectReady,
 			AttrsJSON: []byte(`{"string":"data_id", "foo":[{"bar":"old"}]}`),
-			AttrSensitivePaths: []cty.PathValueMarks{
-				{
-					Path:  cty.GetAttrPath("foo"),
-					Marks: cty.NewValueMarks(marks.Sensitive),
-				},
+			AttrSensitivePaths: []cty.Path{
+				cty.GetAttrPath("foo"),
 			},
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
@@ -2654,11 +2713,8 @@ data "test_data_source" "foo" {
 		&states.ResourceInstanceObjectSrc{
 			Status:    states.ObjectReady,
 			AttrsJSON: []byte(`{"sensitive":"old"}`),
-			AttrSensitivePaths: []cty.PathValueMarks{
-				{
-					Path:  cty.GetAttrPath("sensitive"),
-					Marks: cty.NewValueMarks(marks.Sensitive),
-				},
+			AttrSensitivePaths: []cty.Path{
+				cty.GetAttrPath("sensitive"),
 			},
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
@@ -4522,61 +4578,6 @@ resource "test_object" "a" {
 	}
 }
 
-func TestContext2Plan_plannedState(t *testing.T) {
-	addr := mustResourceInstanceAddr("test_object.a")
-	m := testModuleInline(t, map[string]string{
-		"main.tf": `
-resource "test_object" "a" {
-	test_string = "foo"
-}
-
-locals {
-  local_value = test_object.a.test_string
-}
-
-output "from_local_value" {
-  value = local.local_value
-}
-`,
-	})
-
-	p := simpleMockProvider()
-	ctx := testContext2(t, &ContextOpts{
-		Providers: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
-		},
-	})
-
-	state := states.NewState()
-	plan, diags := ctx.Plan(m, state, nil)
-	if diags.HasErrors() {
-		t.Errorf("expected no errors, but got %s", diags)
-	}
-
-	module := state.RootModule()
-
-	// So, the original state shouldn't have been updated at all.
-	if len(state.RootOutputValues) > 0 {
-		t.Errorf("expected no root output values in the state but found %d", len(state.RootOutputValues))
-	}
-
-	if len(module.Resources) > 0 {
-		t.Errorf("expected no resources in the state but found %d", len(module.Resources))
-	}
-
-	// But, this makes it hard for the testing framework to valid things about
-	// the returned plan. So, the plan contains the planned state:
-	module = plan.PlannedState.RootModule()
-
-	if got, want := plan.PlannedState.RootOutputValues["from_local_value"].Value.AsString(), "foo"; got != want {
-		t.Errorf("expected local value to be %q but was %q", want, got)
-	}
-
-	if module.ResourceInstance(addr.Resource).Current.Status != states.ObjectPlanned {
-		t.Errorf("expected resource to be in planned state")
-	}
-}
-
 func TestContext2Plan_externalProviders(t *testing.T) {
 	// This test exercises the option for callers to pass in their own
 	// already-configured provider instances, instead of the modules runtime
@@ -4836,9 +4837,16 @@ func TestContext2Apply_externalDependencyDeferred(t *testing.T) {
 	if diff := cmp.Diff(wantActions, gotActions, cmpOpts); diff != "" {
 		t.Fatalf("wrong actions in plan\n%s", diff)
 	}
-	// TODO: Once we are including information about the individual
-	// deferred actions in the plan, this would be a good place to
-	// assert that they are correct!
+
+	if len(plan.DeferredResources) != 3 {
+		t.Fatalf("expected exactly 3 deferred resources, got %d", len(plan.DeferredResources))
+	}
+
+	for _, res := range plan.DeferredResources {
+		if res.DeferredReason != providers.DeferredReasonDeferredPrereq {
+			t.Fatalf("expected all resources to be deferred due to deferred prerequisites, but %s was not", res.ChangeSrc.Addr)
+		}
+	}
 }
 
 func TestContext2Plan_removedResourceForgetBasic(t *testing.T) {
@@ -5337,11 +5345,8 @@ resource "test_resource" "a" {
 		&states.ResourceInstanceObjectSrc{
 			Status:    states.ObjectReady,
 			AttrsJSON: []byte(`{"value":"secret"}]}`),
-			AttrSensitivePaths: []cty.PathValueMarks{
-				{
-					Path:  cty.GetAttrPath("value"),
-					Marks: cty.NewValueMarks(marks.Sensitive),
-				},
+			AttrSensitivePaths: []cty.Path{
+				cty.GetAttrPath("value"),
 			},
 		},
 		mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`),
@@ -5418,15 +5423,8 @@ resource "test_object" "obj" {
 	assertNoErrors(t, diags)
 
 	ch := plan.Changes.ResourceInstance(mustResourceInstanceAddr("test_object.obj"))
-	if len(ch.AfterValMarks) == 0 {
+	if len(ch.AfterSensitivePaths) == 0 {
 		t.Fatal("expected marked values in test_object.obj")
-	}
-
-	data := plan.PlannedState.RootModule().ResourceInstance(mustResourceInstanceAddr("data.test_data_source.foo").Resource)
-	if len(data.Current.AttrSensitivePaths) == 0 {
-		// we may not always store data source states in the future, but for now
-		// this is a good indication that the read value was correctly marked.
-		t.Fatal("data.test_data_source.foo schema contains a sensitive attribute, should be marked in state")
 	}
 }
 
@@ -5474,9 +5472,11 @@ resource "test_object" "obj" {
 
 	state := states.BuildState(func(s *states.SyncState) {
 		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.obj"), &states.ResourceInstanceObjectSrc{
-			AttrsJSON:          []byte(`{"id":"z","set_block":[{"foo":"bar"}]}`),
-			AttrSensitivePaths: []cty.PathValueMarks{{Path: cty.Path{cty.GetAttrStep{Name: "set_block"}}, Marks: cty.NewValueMarks(marks.Sensitive)}},
-			Status:             states.ObjectReady,
+			AttrsJSON: []byte(`{"id":"z","set_block":[{"foo":"bar"}]}`),
+			AttrSensitivePaths: []cty.Path{
+				cty.GetAttrPath("set_block"),
+			},
+			Status: states.ObjectReady,
 		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
 	})
 
@@ -5492,5 +5492,294 @@ resource "test_object" "obj" {
 	ch := plan.Changes.ResourceInstance(mustResourceInstanceAddr("test_object.obj"))
 	if ch.Action != plans.NoOp {
 		t.Fatal("expected no change in plan")
+	}
+}
+
+func TestContext2Plan_ephemeralInResource(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			terraform {
+				# Ephemeral values are currently experimental. Remove this
+				# argument if the feature gets stablized and this test otherwise
+				# still makes sense for what was stabilized.
+				experiments = [ephemeral_values]
+
+				required_providers {
+					beep = {
+						source = "terraform.io/builtin/beep"
+					}
+				}
+			}
+
+			variable "in" {
+				type      = string
+				ephemeral = true
+			}
+
+			resource "beep" "boop" {
+				in = var.in
+			}
+
+			data "beep" "boop" {
+				in = var.in
+			}
+		`,
+	})
+
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"beep": {
+				Attributes: map[string]*configschema.Attribute{
+					"in": {
+						Type:     cty.String,
+						Optional: true,
+					},
+				},
+			},
+		},
+	})
+	p.GetProviderSchemaResponse.DataSources = p.GetProviderSchemaResponse.ResourceTypes
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewBuiltInProvider("beep"): testProviderFuncFixed(p),
+		},
+	})
+
+	var wantDiags tfdiags.Diagnostics
+	wantDiags = wantDiags.Append(&hcl.Diagnostic{
+		Severity: hcl.DiagError,
+		Summary:  "Invalid use of ephemeral value",
+		Detail:   "Ephemeral values are not valid in resource arguments, because resource instances must persist between Terraform phases.",
+		Subject: &hcl.Range{
+			Filename: filepath.Join(m.Module.SourceDir, "main.tf"),
+			Start: hcl.Pos{
+				Line: 21, Column: 10, Byte: 442,
+			},
+			End: hcl.Pos{
+				Line: 21, Column: 16, Byte: 448,
+			},
+		},
+	})
+	wantDiags = wantDiags.Append(&hcl.Diagnostic{
+		Severity: hcl.DiagError,
+		Summary:  "Invalid use of ephemeral value",
+		Detail:   "Ephemeral values are not valid in resource arguments, because resource instances must persist between Terraform phases.",
+		Subject: &hcl.Range{
+			Filename: filepath.Join(m.Module.SourceDir, "main.tf"),
+			Start: hcl.Pos{
+				Line: 25, Column: 10, Byte: 488,
+			},
+			End: hcl.Pos{
+				Line: 25, Column: 16, Byte: 494,
+			},
+		},
+	})
+	_, gotDiags := ctx.Plan(
+		m, states.NewState(),
+		SimplePlanOpts(plans.NormalMode, InputValues{
+			"in": {
+				Value:      cty.StringVal("hello"),
+				SourceType: ValueFromCaller,
+			},
+		}),
+	)
+	// We'll use the "for RPC" representation just as a convenient shortcut
+	// to not worry about exactly which diagnostic type Terraform Core chose
+	// to return here.
+	gotDiags = gotDiags.ForRPC()
+	gotDiags.Sort()
+	wantDiags = wantDiags.ForRPC()
+	wantDiags.Sort()
+	if diff := cmp.Diff(wantDiags, gotDiags); diff != "" {
+		t.Errorf("wrong diagnostics\n%s", diff)
+	}
+
+}
+
+func TestContext2Plan_ephemeralInProviderConfig(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			terraform {
+				# Ephemeral values are currently experimental. Remove this
+				# argument if the feature gets stablized and this test otherwise
+				# still makes sense for what was stabilized.
+				experiments = [ephemeral_values]
+
+				required_providers {
+					beep = {
+						source = "terraform.io/builtin/beep"
+					}
+				}
+			}
+
+			variable "in" {
+				type      = string
+				ephemeral = true
+			}
+
+			provider "beep" {
+				in = var.in
+			}
+
+			data "beep" "boop" {
+			}
+		`,
+	})
+
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
+		Provider: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"in": {
+					Type:     cty.String,
+					Optional: true,
+				},
+			},
+		},
+		DataSources: map[string]*configschema.Block{
+			"beep": {},
+		},
+	})
+	p.ReadDataSourceResponse = &providers.ReadDataSourceResponse{
+		State: cty.EmptyObjectVal,
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewBuiltInProvider("beep"): testProviderFuncFixed(p),
+		},
+	})
+
+	_, diags := ctx.Plan(
+		m, states.NewState(),
+		SimplePlanOpts(plans.NormalMode, InputValues{
+			"in": {
+				Value:      cty.StringVal("hello"),
+				SourceType: ValueFromCaller,
+			},
+		}),
+	)
+	assertNoDiagnostics(t, diags)
+
+	if !p.ConfigureProviderCalled {
+		t.Fatal("ConfigureProvider was not called")
+	}
+	got := p.ConfigureProviderRequest.Config
+	want := cty.ObjectVal(map[string]cty.Value{
+		// The value is not marked here, because Terraform Core unmarks it
+		// before calling the provider; ephemerality is Terraform Core's
+		// concern to deal with, not the provider's.
+		"in": cty.StringVal("hello"),
+	})
+	if diff := cmp.Diff(want, got, ctydebug.CmpOptions); diff != "" {
+		t.Errorf("wrong provider configuration\n%s", diff)
+	}
+}
+
+// This test explicitly reproduces the issue described in #34976.
+func TestContext2Plan_34976(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+data "test_object" "obj" {}
+
+module "a" {
+  depends_on = [data.test_object.obj]
+  source = "./mod"
+}
+
+output "value" {
+  value = try(module.a.notreal, null)
+}
+`,
+		"mod/main.tf": ``,
+	})
+
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
+		DataSources: map[string]*configschema.Block{
+			"test_object": {},
+		},
+	})
+	p.ReadDataSourceFn = func(req providers.ReadDataSourceRequest) providers.ReadDataSourceResponse {
+
+		// Just very small delay that means the output will be processed before
+		// the module.
+		time.Sleep(50 * time.Millisecond)
+
+		return providers.ReadDataSourceResponse{
+			State: req.Config,
+		}
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	// Just shouldn't crash.
+	_, diags := ctx.Plan(m, states.NewState(), SimplePlanOpts(plans.NormalMode, testInputValuesUnset(m.Module.Variables)))
+	assertNoErrors(t, diags)
+}
+
+func TestContext2Plan_sensitiveRequiredReplace(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "obj" {
+	value = "changed"
+}
+`,
+	})
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+		ResourceTypes: map[string]providers.Schema{
+			"test_object": {
+				Block: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"value": {
+							Type:      cty.String,
+							Required:  true,
+							Sensitive: true,
+						},
+					},
+				},
+			},
+		},
+	}
+	p.PlanResourceChangeResponse = &providers.PlanResourceChangeResponse{
+		PlannedState: cty.ObjectVal(map[string]cty.Value{
+			"value": cty.StringVal("changed"),
+		}),
+		RequiresReplace: []cty.Path{
+			cty.GetAttrPath("value"),
+		},
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(
+			mustResourceInstanceAddr("test_object.obj"),
+			&states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustParseJson(map[string]any{
+					"value": "original",
+				}),
+				AttrSensitivePaths: []cty.Path{
+					cty.GetAttrPath("value"),
+				},
+				Status: states.ObjectReady,
+			},
+			mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	_, diags := ctx.Plan(m, state, nil)
+	if len(diags) > 0 {
+		t.Errorf("unexpected diags\n%s", diags)
 	}
 }

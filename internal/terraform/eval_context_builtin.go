@@ -221,6 +221,9 @@ func (ctx *BuiltinEvalContext) ConfigureProvider(addr addrs.AbsProviderConfig, c
 	req := providers.ConfigureProviderRequest{
 		TerraformVersion: version.String(),
 		Config:           cfg,
+		ClientCapabilities: providers.ClientCapabilities{
+			DeferralAllowed: ctx.Deferrals().DeferralAllowed(),
+		},
 	}
 
 	resp := p.ConfigureProvider(req)
@@ -440,7 +443,10 @@ func (ctx *BuiltinEvalContext) EvaluationScope(self addrs.Referenceable, source 
 	switch scope := ctx.scope.(type) {
 	case evalContextModuleInstance:
 		data := &evaluationStateData{
-			Evaluator:       ctx.Evaluator,
+			evaluationData: &evaluationData{
+				Evaluator: ctx.Evaluator,
+				Module:    scope.Addr.Module(),
+			},
 			ModulePath:      scope.Addr,
 			InstanceKeyData: keyData,
 			Operation:       ctx.Evaluator.Operation,
@@ -460,7 +466,10 @@ func (ctx *BuiltinEvalContext) EvaluationScope(self addrs.Referenceable, source 
 		return evalScope
 	case evalContextPartialExpandedModule:
 		data := &evaluationPlaceholderData{
-			Evaluator:      ctx.Evaluator,
+			evaluationData: &evaluationData{
+				Evaluator: ctx.Evaluator,
+				Module:    scope.Addr.Module(),
+			},
 			ModulePath:     scope.Addr,
 			CountAvailable: keyData.CountIndex != cty.NilVal,
 			EachAvailable:  keyData.EachKey != cty.NilVal,

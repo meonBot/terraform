@@ -6,9 +6,11 @@ package plans
 import (
 	"fmt"
 
-	"github.com/hashicorp/terraform/internal/addrs"
-	"github.com/hashicorp/terraform/internal/states"
 	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/lang/marks"
+	"github.com/hashicorp/terraform/internal/states"
 )
 
 // ResourceInstanceChangeSrc is a not-yet-decoded ResourceInstanceChange.
@@ -205,6 +207,26 @@ func (ocs *OutputChangeSrc) DeepCopy() *OutputChangeSrc {
 type ImportingSrc struct {
 	// ID is the original ID of the imported resource.
 	ID string
+
+	// Unknown is true if the ID was unknown when we tried to import it. This
+	// should only be true if the overall change is embedded within a deferred
+	// action.
+	Unknown bool
+}
+
+// Decode unmarshals the raw representation of the importing action.
+func (is *ImportingSrc) Decode() *Importing {
+	if is == nil {
+		return nil
+	}
+	if is.Unknown {
+		return &Importing{
+			ID: cty.UnknownVal(cty.String),
+		}
+	}
+	return &Importing{
+		ID: cty.StringVal(is.ID),
+	}
 }
 
 // ChangeSrc is a not-yet-decoded Change.
@@ -217,12 +239,13 @@ type ChangeSrc struct {
 	// storage.
 	Before, After DynamicValue
 
-	// BeforeValMarks and AfterValMarks are stored path+mark combinations
-	// that might be discovered when encoding a change. Marks are removed
-	// to enable encoding (marked values cannot be marshalled), and so storing
-	// the path+mark combinations allow us to re-mark the value later
-	// when, for example, displaying the diff to the UI.
-	BeforeValMarks, AfterValMarks []cty.PathValueMarks
+	// BeforeSensitivePaths and AfterSensitivePaths are the paths for any
+	// values in Before or After (respectively) that are considered to be
+	// sensitive. The sensitive marks are removed from the in-memory values
+	// to enable encoding (marked values cannot be marshalled), and so we
+	// store the sensitive paths to allow re-marking later when we decode
+	// the serialized change.
+	BeforeSensitivePaths, AfterSensitivePaths []cty.Path
 
 	// Importing is present if the resource is being imported as part of this
 	// change.
@@ -263,16 +286,11 @@ func (cs *ChangeSrc) Decode(ty cty.Type) (*Change, error) {
 		}
 	}
 
-	var importing *Importing
-	if cs.Importing != nil {
-		importing = &Importing{ID: cs.Importing.ID}
-	}
-
 	return &Change{
 		Action:          cs.Action,
-		Before:          before.MarkWithPaths(cs.BeforeValMarks),
-		After:           after.MarkWithPaths(cs.AfterValMarks),
-		Importing:       importing,
+		Before:          marks.MarkPaths(before, marks.Sensitive, cs.BeforeSensitivePaths),
+		After:           marks.MarkPaths(after, marks.Sensitive, cs.AfterSensitivePaths),
+		Importing:       cs.Importing.Decode(),
 		GeneratedConfig: cs.GeneratedConfig,
 	}, nil
 }

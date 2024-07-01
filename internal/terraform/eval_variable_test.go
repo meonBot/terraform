@@ -1173,14 +1173,20 @@ func TestEvalVariableValidations_jsonErrorMessageEdgeCase(t *testing.T) {
 
 			// We need a minimal scope to allow basic functions to be passed to
 			// the HCL scope
-			ctx.EvaluationScopeScope = &lang.Scope{}
+			ctx.EvaluationScopeScope = &lang.Scope{
+				Data: &fakeEvaluationData{
+					inputVariables: map[addrs.InputVariable]cty.Value{
+						varAddr.Variable: test.given,
+					},
+				},
+			}
 			ctx.NamedValuesState = namedvals.NewState()
 			ctx.NamedValuesState.SetInputVariableValue(varAddr, test.given)
 			ctx.ChecksState = checks.NewState(cfg)
 			ctx.ChecksState.ReportCheckableObjects(varAddr.ConfigCheckable(), addrs.MakeSet[addrs.Checkable](varAddr))
 
 			gotDiags := evalVariableValidations(
-				varAddr, varCfg, nil, ctx,
+				varAddr, ctx, varCfg.Validations, varCfg.DeclRange,
 			)
 
 			if ctx.ChecksState.ObjectCheckStatus(varAddr) != test.status {
@@ -1322,18 +1328,24 @@ variable "bar" {
 
 			// We need a minimal scope to allow basic functions to be passed to
 			// the HCL scope
-			ctx.EvaluationScopeScope = &lang.Scope{}
-			ctx.NamedValuesState = namedvals.NewState()
+			varVal := test.given
 			if varCfg.Sensitive {
-				ctx.NamedValuesState.SetInputVariableValue(varAddr, test.given.Mark(marks.Sensitive))
-			} else {
-				ctx.NamedValuesState.SetInputVariableValue(varAddr, test.given)
+				varVal = varVal.Mark(marks.Sensitive)
 			}
+			ctx.EvaluationScopeScope = &lang.Scope{
+				Data: &fakeEvaluationData{
+					inputVariables: map[addrs.InputVariable]cty.Value{
+						varAddr.Variable: varVal,
+					},
+				},
+			}
+			ctx.NamedValuesState = namedvals.NewState()
+			ctx.NamedValuesState.SetInputVariableValue(varAddr, varVal)
 			ctx.ChecksState = checks.NewState(cfg)
 			ctx.ChecksState.ReportCheckableObjects(varAddr.ConfigCheckable(), addrs.MakeSet[addrs.Checkable](varAddr))
 
 			gotDiags := evalVariableValidations(
-				varAddr, varCfg, nil, ctx,
+				varAddr, ctx, varCfg.Validations, varCfg.DeclRange,
 			)
 
 			if ctx.ChecksState.ObjectCheckStatus(varAddr) != test.status {
